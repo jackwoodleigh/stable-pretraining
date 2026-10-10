@@ -116,28 +116,90 @@ The reported measurements came from the archived experiment; the example uses
 the library's Manager/Lightning lifecycle. Hardware, software versions, and
 floating-point execution can affect results, so identical scores are not guaranteed.
 
+Tests cover masking, numerical loss computation, gradients, training integration,
+checkpoint restoration, and distributed correctness. The public example was
+compared against the archived protocol and validated with four-process training
+and a separate BF16 Blackwell GPU smoke test, including full val2017 evaluation.
+The final example was not rerun for the full 100-epoch experiments.
+
 Validation
 ----------
 
-A matched seed-0 COCO experiment trained ViT-Small/16 and a six-layer width-256
-text encoder from scratch for 100 epochs (11,673,600 pairs each). Training used
-117,287 images, global batch 1,024, BF16, and identical initialization, data streams,
-and optimizer settings. Both fixed final checkpoints were evaluated unmasked
-on all 5,000 val2017 images and 25,014 captions.
+Matched seed-0 COCO experiments trained CLIP, FLIP 50%, and FLIP 75% from scratch
+for 100 epochs (11,673,600 pairs each), using ViT-Small/16 and a six-layer
+width-256 text encoder. Training used 117,287 images, global batch 1,024, BF16,
+four NVIDIA RTX PRO 6000 Blackwell Max-Q GPUs, and identical initialization,
+data streams, and optimizer settings. The image encoder processed 197, 99, and
+50 tokens respectively, including CLS. All three fixed final checkpoints were
+evaluated unmasked on all 5,000 val2017 images and 25,014 captions.
 
 .. csv-table:: Final COCO retrieval (percent)
    :header: "Model", "Image-to-text R@1 / R@5 / R@10", "Text-to-image R@1 / R@5 / R@10"
 
    CLIP, 14.28 / 34.84 / 46.92, 10.25 / 28.42 / 39.84
    FLIP 50%, 14.72 / 34.96 / 46.54, 10.22 / 28.28 / 39.68
+   FLIP 75%, 12.84 / 33.30 / 44.94, 9.43 / 26.78 / 37.74
 
-Mean bidirectional R@1 was 12.27% for CLIP and 12.47% for FLIP. Peak allocated
-GPU memory was 9.21 GiB and 5.36 GiB, respectively. These are single-seed,
-reduced-scale validation results, not a reproduction of the paper's large-scale
-LAION experiments. Validation scores had been inspected in earlier experiments;
-the fixed final checkpoints were not selected using these scores.
+FLIP 50% achieved similar retrieval scores to CLIP. At 75% masking,
+image-to-text R@10 decreased by 1.98 percentage points and text-to-image R@10
+by 2.10 points relative to CLIP.
 
-Masking reduces image-encoder work, while end-to-end speed also depends on
-loading, text encoding, optimization, and distributed communication. Benchmark
-with warmed-up kernels and asynchronous execution; per-update diagnostic
-synchronization can obscure the savings.
+Mean bidirectional R@1 was 12.27%, 12.47%, and 11.14% for CLIP, FLIP 50%, and
+FLIP 75%, respectively. Peak allocated memory per GPU was 9.21, 5.36, and
+3.40 GiB. Training processes took 40.97, 40.09, and 41.06 minutes, including
+development checks and checkpointing but excluding final retrieval evaluation.
+These are single-seed, reduced-scale validation results, not a reproduction of
+the paper's large-scale LAION experiments. Validation scores had been inspected
+in earlier experiments; the fixed final checkpoints were not selected using
+these scores.
+
+Single-GPU update benchmark
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A separate benchmark used the same model sizes on one Blackwell Max-Q GPU with
+batch size 256, BF16, and fused AdamW. Synthetic images and cached COCO captions
+were resident on the GPU. Timings include forward, contrastive loss, backward,
+gradient clipping, and optimizer updates; they exclude decoding, loading, and
+transfer. Each result averages two runs in reversed order, each with 20 warmup
+and 100 measured updates, synchronizing only at timing boundaries.
+
+.. csv-table:: GPU-resident update performance
+   :header: "Model", "Time/update (ms)", "Pairs/s", "Speedup", "Peak allocated memory (GiB)"
+
+   CLIP, 83.6, 3061, 1.00x, 9.08
+   FLIP 50%, 42.8, 5988, 1.96x, 5.23
+   FLIP 75%, 26.3, 9744, 3.18x, 3.27
+
+Peak allocated memory decreased by approximately 42% at 50% masking and 64% at
+75% masking relative to CLIP.
+
+Single-GPU input-pipeline profiling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Short diagnostic runs used the FLIP implementation with the archived data
+pipeline on one Blackwell Max-Q GPU: batch size 256, BF16, standard AdamW,
+eight workers, and node-local COCO images. Each result averages two runs
+in reversed order, each with 20 warmup and 80 measured updates. These measurements
+cover the update loop, including data loading and transfer, rather than a full
+example run.
+
+.. csv-table:: CLIP versus FLIP 75% update times
+   :header: "Input preparation", "CLIP (ms/update)", "FLIP 75% (ms/update)", "Speedup"
+
+   Live COCO with CPU normalization, 116.8, 114.6, 1.02x
+   Live COCO with GPU normalization, 99.9, 101.6, 0.98x
+   Repeated prepared COCO batch, 87.6, 29.5, 2.97x
+
+The prepared-input control repeatedly reused one real batch from pinned
+CPU memory, still transferring it on every update. It measures capacity with
+image preparation removed, not full-dataset training throughput with fresh
+augmentations. All three cases omit per-update diagnostic synchronization and
+run without distributed communication.
+
+Live COCO updates took nearly the same time for both models, while prepared
+input enabled a 2.97x speedup. These results suggest that input preparation is a
+major bottleneck. Masking happens after image loading, decoding, and augmentation,
+so those costs remain. GPU normalization improves both models' absolute times
+but does not restore a relative speedup. Decoding, augmentation, and worker
+scheduling were not isolated individually; further input-pipeline optimization
+was outside this validation.
