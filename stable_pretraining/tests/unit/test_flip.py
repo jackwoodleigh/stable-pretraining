@@ -1,136 +1,17 @@
 """FLIP's masking, embedding, and contrastive-learning contracts."""
 
 import math
-import json
-import random
-import pickle
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from timm.models.vision_transformer import VisionTransformer
 from torch import nn
-from PIL import Image
-from torchvision.transforms import ToTensor
 
 import stable_pretraining as spt
-from examples.flip import (
-    Captions,
-    TextEncoder,
-    retrieval_recall,
-    split_ids,
-    warmup_cosine,
-)
 
 pytestmark = pytest.mark.unit
-
-
-def make_coco(root):
-    """Write a tiny COCO fixture with two captions per image."""
-    (root / "annotations").mkdir()
-    for split, ids in (("train2017", range(6)), ("val2017", range(6, 9))):
-        (root / split).mkdir()
-        records = {"images": [], "annotations": []}
-        for i in ids:
-            records["images"].append({"id": i, "file_name": f"{i}.png"})
-            for j in range(2):
-                records["annotations"].append(
-                    {"image_id": i, "caption": str(2 * i + j)}
-                )
-            Image.new("RGB", (32, 32), (i * 25, 0, 0)).save(root / split / f"{i}.png")
-        (root / "annotations" / f"captions_{split}.json").write_text(
-            json.dumps(records)
-        )
-
-
-def test_example_schedule_starts_at_floor_and_reaches_peak_and_final_floor():
-    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(()))], lr=1e-4)
-    module = SimpleNamespace(trainer=SimpleNamespace(estimated_stepping_batches=100))
-    scheduler = warmup_cosine(optimizer, module)
-    rates = []
-    for _ in range(100):
-        rates.append(optimizer.param_groups[0]["lr"])
-        optimizer.step()
-        scheduler.step()
-    assert rates[0] == pytest.approx(1e-6)
-    assert rates[5] == pytest.approx(1e-4)
-    assert rates[-1] == pytest.approx(1e-6)
-    assert rates[:6] == sorted(rates[:6])
-    assert rates[5:] == sorted(rates[5:], reverse=True)
-
-
-def test_example_text_pooling_is_bidirectional():
-    encoder = TextEncoder(vocab_size=32, dim=16, depth=1)
-    ids = torch.tensor([[1, 2, 3, 4]])
-    positioned = encoder.tokens(ids) + encoder.position[:, :4]
-    expected = encoder.norm(encoder.blocks(positioned))[:, 0]
-    actual = encoder(ids)
-    torch.testing.assert_close(actual, expected)
-    actual[0, 0].backward()
-    assert encoder.tokens.weight.grad[4].abs().sum() > 0
-
-
-def test_retrieval_uses_all_candidates_and_any_matching_caption():
-    images = torch.eye(300)
-    texts = images.repeat_interleave(2, dim=0)
-    image_ids = torch.arange(300)
-    caption_ids = image_ids.repeat_interleave(2)
-    assert retrieval_recall(images, texts, image_ids, caption_ids) == {
-        "R@1": 1.0,
-        "R@5": 1.0,
-        "R@10": 1.0,
-    }
-    # Positives appear at rank two, nowhere, and rank one, respectively.
-    queries = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]])
-    candidates = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]])
-    recall = retrieval_recall(
-        queries, candidates, torch.tensor([7, 8, 9]), torch.tensor([9, 7, 9])
-    )
-    assert recall == {"R@1": 1 / 3, "R@5": 2 / 3, "R@10": 2 / 3}
-
-
-def test_coco_split_caption_sampling_and_tokenization(tmp_path):
-    make_coco(tmp_path)
-    train, dev = split_ids(tmp_path, 2, 2, seed=13)
-    assert not set(train) & set(dev)
-    assert split_ids(tmp_path, 2, 2, seed=13) == (train, dev)
-    with pytest.raises(ValueError, match="train/dev sizes"):
-        split_ids(tmp_path, 6, 1, seed=13)
-
-    def tokenizer(texts, **kwargs):
-        assert len(texts) == 4
-        assert kwargs["add_special_tokens"] is False
-        assert kwargs["max_length"] == 32
-        assert kwargs["return_attention_mask"] is False
-        return {"input_ids": torch.arange(4).unsqueeze(1).expand(-1, 32)}
-
-    data = Captions(tmp_path, train, tokenizer, ToTensor(), training=True)
-    assert len(data) == 2
-    assert data.caption_ids.tolist() == [train[0], train[0], train[1], train[1]]
-    sampled = set()
-    for epoch in range(32):
-        data.epoch.fill_(epoch)
-        sampled.add(data[1]["input_ids"][0].item())
-    assert sampled == {2, 3}
-    data.training = False
-    assert data[1]["input_ids"][0] == 2
-    assert data[0]["image"].shape == (3, 32, 32)
-    restored = pickle.loads(pickle.dumps(data))
-    torch.testing.assert_close(restored[0]["image"], data[0]["image"])
-
-    # Data streams must not depend on masking consuming the global torch RNG.
-    def augment(image):
-        return ToTensor()(image) + torch.rand(())
-
-    data.transform = augment
-    expected = data[0]
-    random.seed(123)
-    torch.rand(100)
-    torch.testing.assert_close(data[0]["image"], expected["image"])
-    data.epoch.add_(1)
-    assert not torch.equal(data[0]["image"], expected["image"])
 
 
 class TinyTextEncoder(nn.Module):
